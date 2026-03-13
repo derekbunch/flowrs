@@ -32,6 +32,9 @@ pub struct EnvironmentData {
 
     /// Result of `get_task_logs(dag_id, dag_run_id, task_id, try)` — flat composite key.
     pub task_logs: HashMap<(DagId, DagRunId, TaskId), Vec<Log>>,
+
+    /// Result of `get_dag_params(dag_id)` — keyed by `dag_id`.
+    pub dag_params: HashMap<DagId, serde_json::Value>,
 }
 
 impl EnvironmentData {
@@ -43,6 +46,7 @@ impl EnvironmentData {
             dag_runs: HashMap::new(),
             task_instances: HashMap::new(),
             task_logs: HashMap::new(),
+            dag_params: HashMap::new(),
         }
     }
 
@@ -73,6 +77,11 @@ impl EnvironmentData {
     ) {
         self.task_instances
             .insert((dag_id.clone(), dag_run_id.clone()), task_instances);
+    }
+
+    /// Replace params for a single DAG.
+    pub fn update_dag_params(&mut self, dag_id: &DagId, params: serde_json::Value) {
+        self.dag_params.insert(dag_id.clone(), params);
     }
 
     /// Replace logs for a specific task instance.
@@ -152,6 +161,13 @@ impl EnvironmentStateContainer {
             })
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Get params for a specific DAG in the active environment.
+    pub fn get_active_dag_params(&self, dag_id: &DagId) -> Option<serde_json::Value> {
+        self.get_active_environment()
+            .and_then(|env| env.dag_params.get(dag_id))
+            .cloned()
     }
 
     /// Get logs for a specific task instance in the active environment.

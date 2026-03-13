@@ -62,8 +62,16 @@ impl DagRunOperations for V2Client {
         Ok(())
     }
 
-    async fn trigger_dag_run(&self, dag_id: &str, logical_date: Option<&str>) -> Result<()> {
-        let body = serde_json::json!({"logical_date": logical_date});
+    async fn trigger_dag_run(
+        &self,
+        dag_id: &str,
+        logical_date: Option<&str>,
+        conf: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({"logical_date": logical_date});
+        if let Some(conf) = conf {
+            body["conf"] = conf;
+        }
 
         let resp: Response = self
             .base_api(Method::POST, &format!("dags/{dag_id}/dagRuns"))

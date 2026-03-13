@@ -77,4 +77,15 @@ impl DagOperations for V1Client {
         let code = response.text().await?;
         Ok(code)
     }
+
+    async fn get_dag_params(&self, dag_id: &str) -> Result<Option<serde_json::Value>> {
+        let response = self
+            .base_api(Method::GET, &format!("dags/{dag_id}/details"))
+            .await?
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: serde_json::Value = response.json().await?;
+        Ok(body.get("params").cloned())
+    }
 }

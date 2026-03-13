@@ -75,4 +75,15 @@ impl DagOperations for V2Client {
         let dag_source: model::dag::DagSource = response.json().await?;
         Ok(dag_source.content)
     }
+
+    async fn get_dag_params(&self, dag_id: &str) -> Result<Option<serde_json::Value>> {
+        let response = self
+            .base_api(Method::GET, &format!("dags/{dag_id}"))
+            .await?
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: serde_json::Value = response.json().await?;
+        Ok(body.get("params").cloned())
+    }
 }
