@@ -27,9 +27,41 @@ enum FocusZone {
     Buttons,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum ParamKind {
+    /// Free-text input
+    Text,
+    /// Boolean toggle (true/false)
+    Bool,
+    /// Fixed set of allowed values (from schema.enum)
+    Enum(Vec<String>),
+    /// Suggested values but free-text also allowed (from schema.examples)
+    Examples(Vec<String>),
+}
+
+struct ParamEntry {
+    key: String,
+    value: String,
+    description: Option<String>,
+    kind: ParamKind,
+}
+
+impl ParamEntry {
+    fn has_options(&self) -> bool {
+        matches!(self.kind, ParamKind::Enum(_) | ParamKind::Examples(_))
+    }
+
+    fn options(&self) -> &[String] {
+        match &self.kind {
+            ParamKind::Enum(opts) | ParamKind::Examples(opts) => opts,
+            _ => &[],
+        }
+    }
+}
+
 pub struct TriggerDagRunPopUp {
     pub dag_id: DagId,
-    params: Vec<(String, String)>,
+    params: Vec<ParamEntry>,
     active_param: usize,
     editing: bool,
     cursor_pos: usize,
@@ -42,11 +74,7 @@ impl TriggerDagRunPopUp {
     pub fn new(dag_id: DagId, raw_params: Option<&serde_json::Value>) -> Self {
         let params = raw_params
             .and_then(|v| v.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .map(|(k, v)| (k.clone(), extract_default_value(v)))
-                    .collect::<Vec<_>>()
-            })
+            .map(|obj| obj.iter().map(|(k, v)| extract_param(k, v)).collect())
             .unwrap_or_default();
 
         Self {
@@ -70,22 +98,139 @@ impl TriggerDagRunPopUp {
             return None;
         }
         let mut map = serde_json::Map::new();
-        for (key, value) in &self.params {
-            let parsed =
-                serde_json::from_str(value).unwrap_or(serde_json::Value::String(value.clone()));
-            map.insert(key.clone(), parsed);
+        for entry in &self.params {
+            let parsed = serde_json::from_str(&entry.value)
+                .unwrap_or(serde_json::Value::String(entry.value.clone()));
+            map.insert(entry.key.clone(), parsed);
         }
         Some(serde_json::Value::Object(map))
     }
-}
 
-fn extract_default_value(v: &serde_json::Value) -> String {
-    if let Some(obj) = v.as_object() {
-        if let Some(default) = obj.get("default") {
-            return value_to_string(default);
+    fn active_entry(&self) -> &ParamEntry {
+        &self.params[self.active_param]
+    }
+
+    fn cycle_option(&mut self, forward: bool) {
+        let entry = &mut self.params[self.active_param];
+        let (ParamKind::Enum(opts) | ParamKind::Examples(opts)) = &entry.kind else {
+            return;
+        };
+        if opts.is_empty() {
+            return;
+        }
+        let current_idx = opts.iter().position(|o| *o == entry.value).unwrap_or(0);
+        let next_idx = if forward {
+            (current_idx + 1) % opts.len()
+        } else {
+            current_idx.checked_sub(1).unwrap_or(opts.len() - 1)
+        };
+        entry.value = opts[next_idx].clone();
+    }
+
+    fn toggle_bool(&mut self) {
+        let entry = &mut self.params[self.active_param];
+        if entry.kind == ParamKind::Bool {
+            entry.value = if entry.value == "true" {
+                "false"
+            } else {
+                "true"
+            }
+            .to_string();
         }
     }
-    value_to_string(v)
+}
+
+fn extract_param(key: &str, v: &serde_json::Value) -> ParamEntry {
+    let Some(obj) = v.as_object() else {
+        return ParamEntry {
+            key: key.to_owned(),
+            value: value_to_string(v),
+            description: None,
+            kind: kind_from_value(v),
+        };
+    };
+
+    // Airflow wrapped Param class (2.6+): has "__class" key
+    if obj.contains_key("__class") {
+        let raw_value = obj.get("value").filter(|v| !v.is_null());
+        let value = raw_value.map_or_else(String::new, value_to_string);
+
+        let description = obj
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+
+        let schema = obj.get("schema");
+        let kind = kind_from_schema(schema, raw_value);
+
+        return ParamEntry {
+            key: key.to_owned(),
+            value,
+            description,
+            kind,
+        };
+    }
+
+    // Some Airflow versions use a "default" key
+    if let Some(default) = obj.get("default") {
+        return ParamEntry {
+            key: key.to_owned(),
+            value: value_to_string(default),
+            description: None,
+            kind: kind_from_value(default),
+        };
+    }
+
+    ParamEntry {
+        key: key.to_owned(),
+        value: value_to_string(v),
+        description: None,
+        kind: ParamKind::Text,
+    }
+}
+
+fn kind_from_value(v: &serde_json::Value) -> ParamKind {
+    if v.is_boolean() {
+        ParamKind::Bool
+    } else {
+        ParamKind::Text
+    }
+}
+
+fn kind_from_schema(
+    schema: Option<&serde_json::Value>,
+    raw_value: Option<&serde_json::Value>,
+) -> ParamKind {
+    let Some(schema) = schema.and_then(|s| s.as_object()) else {
+        return raw_value.map_or(ParamKind::Text, kind_from_value);
+    };
+
+    // Check for enum (closed set)
+    if let Some(values) = schema.get("enum").and_then(|v| v.as_array()) {
+        let opts: Vec<String> = values.iter().map(value_to_string).collect();
+        if !opts.is_empty() {
+            return ParamKind::Enum(opts);
+        }
+    }
+
+    // Check for examples (open set with suggestions)
+    if let Some(values) = schema.get("examples").and_then(|v| v.as_array()) {
+        let opts: Vec<String> = values.iter().map(value_to_string).collect();
+        if !opts.is_empty() {
+            return ParamKind::Examples(opts);
+        }
+    }
+
+    // Check schema type for booleans
+    if schema
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t == "boolean")
+    {
+        return ParamKind::Bool;
+    }
+
+    raw_value.map_or(ParamKind::Text, kind_from_value)
 }
 
 fn value_to_string(v: &serde_json::Value) -> String {
@@ -181,9 +326,26 @@ impl TriggerDagRunPopUp {
                     }
                     return (Some(FlowrsEvent::Key(key_event)), vec![]);
                 }
-                // Enter on params zone: start editing
-                self.editing = true;
-                self.cursor_pos = self.params[self.active_param].1.len();
+                match self.active_entry().kind {
+                    // Bool: toggle on Enter instead of opening text editor
+                    ParamKind::Bool => self.toggle_bool(),
+                    // Enum: cycle on Enter (no free-text editing)
+                    ParamKind::Enum(_) => self.cycle_option(true),
+                    // Text and Examples: open text editor
+                    _ => {
+                        self.editing = true;
+                        self.cursor_pos = self.active_entry().value.len();
+                    }
+                }
+                (None, vec![])
+            }
+            KeyCode::Char(' ') if self.focus == FocusZone::Params => {
+                // Space toggles bools and cycles enums/examples for quick editing
+                match self.active_entry().kind {
+                    ParamKind::Bool => self.toggle_bool(),
+                    ParamKind::Enum(_) | ParamKind::Examples(_) => self.cycle_option(true),
+                    ParamKind::Text => {}
+                }
                 (None, vec![])
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -213,7 +375,7 @@ impl TriggerDagRunPopUp {
         code: KeyCode,
         key_event: crossterm::event::KeyEvent,
     ) -> (Option<FlowrsEvent>, Vec<WorkerMessage>) {
-        let value = &mut self.params[self.active_param].1;
+        let value = &mut self.params[self.active_param].value;
         match code {
             KeyCode::Esc | KeyCode::Enter => {
                 self.editing = false;
@@ -268,6 +430,11 @@ impl Widget for &mut TriggerDagRunPopUp {
         }
     }
 }
+
+const GHOST_STYLE: Style = Style {
+    fg: Some(PURPLE_DIM),
+    ..DEFAULT_STYLE
+};
 
 impl TriggerDagRunPopUp {
     fn render_simple(&mut self, area: Rect, buffer: &mut Buffer) {
@@ -327,6 +494,7 @@ impl TriggerDagRunPopUp {
 
         let inner = popup_block.inner(area);
 
+        // Each param gets 2 rows: value line + description/options ghost line
         let [header_area, params_area, _, buttons_area, _] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(3),
@@ -340,10 +508,12 @@ impl TriggerDagRunPopUp {
             .style(DEFAULT_STYLE)
             .centered();
 
+        let rows_per_param: usize = 2;
+        let visible_params = params_area.height as usize / rows_per_param;
+
         // Scroll handling
-        let visible_rows = params_area.height as usize;
-        if self.active_param >= self.scroll_offset + visible_rows {
-            self.scroll_offset = self.active_param + 1 - visible_rows;
+        if self.active_param >= self.scroll_offset + visible_params {
+            self.scroll_offset = self.active_param + 1 - visible_params;
         }
         if self.active_param < self.scroll_offset {
             self.scroll_offset = self.active_param;
@@ -353,33 +523,32 @@ impl TriggerDagRunPopUp {
         popup_block.render(area, buffer);
         header.render(header_area, buffer);
 
-        // Render param rows
-        let max_key_len = self
-            .params
-            .iter()
-            .map(|(k, _)| k.len())
-            .max()
-            .unwrap_or(0)
-            .min(20);
+        let max_key_len = self.params.iter().map(|e| e.key.len()).max().unwrap_or(0);
 
-        for (row_idx, (i, (key, value))) in self
+        for (row_idx, (i, entry)) in self
             .params
             .iter()
             .enumerate()
             .skip(self.scroll_offset)
-            .take(visible_rows)
+            .take(visible_params)
             .enumerate()
         {
-            let Some(row_offset) = u16::try_from(row_idx).ok() else {
+            let Some(row_offset) = u16::try_from(row_idx * rows_per_param).ok() else {
                 break;
             };
             let row_y = params_area.y + row_offset;
-            if row_y >= params_area.y + params_area.height {
+            if row_y + 1 >= params_area.y + params_area.height {
                 break;
             }
             let row_area = Rect::new(
                 params_area.x + 1,
                 row_y,
+                params_area.width.saturating_sub(2),
+                1,
+            );
+            let ghost_area = Rect::new(
+                params_area.x + 1,
+                row_y + 1,
                 params_area.width.saturating_sub(2),
                 1,
             );
@@ -391,46 +560,20 @@ impl TriggerDagRunPopUp {
                 Style::default().fg(TEXT_PRIMARY)
             };
 
-            let truncated_key = if key.len() > max_key_len {
-                format!("{}…", &key[..max_key_len.saturating_sub(1)])
+            let truncated_key = if entry.key.len() > max_key_len {
+                format!("{}…", &entry.key[..max_key_len.saturating_sub(1)])
             } else {
-                format!("{key:max_key_len$}")
+                format!("{:max_key_len$}", entry.key)
             };
 
-            let value_display = if is_active && self.editing {
-                let (before, after) = value.split_at(self.cursor_pos.min(value.len()));
-                let cursor_char = after.chars().next().unwrap_or(' ');
-                let rest = if after.is_empty() {
-                    String::new()
-                } else {
-                    after[cursor_char.len_utf8()..].to_string()
-                };
-                vec![
-                    Span::styled(format!("{truncated_key}: "), key_style),
-                    Span::styled(before.to_string(), Style::default().fg(TEXT_PRIMARY)),
-                    Span::styled(
-                        cursor_char.to_string(),
-                        Style::default()
-                            .fg(SURFACE_STYLE.bg.unwrap_or(ratatui::style::Color::Black))
-                            .bg(TEXT_PRIMARY),
-                    ),
-                    Span::styled(rest, Style::default().fg(TEXT_PRIMARY)),
-                ]
-            } else {
-                let bracket_style = if is_active {
-                    Style::default().fg(ACCENT)
-                } else {
-                    Style::default().fg(PURPLE_DIM)
-                };
-                vec![
-                    Span::styled(format!("{truncated_key}: "), key_style),
-                    Span::styled("[", bracket_style),
-                    Span::styled(value.clone(), Style::default().fg(TEXT_PRIMARY)),
-                    Span::styled("]", bracket_style),
-                ]
-            };
+            let value_line = self.render_value_line(entry, &truncated_key, key_style, is_active);
+            value_line.render(row_area, buffer);
 
-            Line::from(value_display).render(row_area, buffer);
+            // Ghost line: description, or options list, or kind hint
+            let ghost_line = render_ghost_line(entry, max_key_len, is_active);
+            if let Some(line) = ghost_line {
+                line.render(ghost_area, buffer);
+            }
         }
 
         // Buttons
@@ -450,4 +593,134 @@ impl TriggerDagRunPopUp {
         yes_btn.render(yes, buffer);
         no_btn.render(no, buffer);
     }
+
+    fn render_value_line(
+        &self,
+        entry: &ParamEntry,
+        truncated_key: &str,
+        key_style: Style,
+        is_active: bool,
+    ) -> Line<'static> {
+        if is_active && self.editing {
+            return self.render_editing_line(entry, truncated_key, key_style);
+        }
+
+        let bracket_style = if is_active {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(PURPLE_DIM)
+        };
+
+        let mut spans = vec![Span::styled(format!("{truncated_key}: "), key_style)];
+
+        match &entry.kind {
+            ParamKind::Bool => {
+                let (symbol, color) = if entry.value == "true" {
+                    ("✓ true", ACCENT)
+                } else {
+                    ("✗ false", PURPLE_DIM)
+                };
+                spans.push(Span::styled(symbol.to_string(), Style::default().fg(color)));
+                if is_active {
+                    spans.push(Span::styled(" <Space> toggle", GHOST_STYLE));
+                }
+            }
+            ParamKind::Enum(opts) => {
+                let current_idx = opts.iter().position(|o| *o == entry.value);
+                spans.push(Span::styled("[", bracket_style));
+                spans.push(Span::styled(
+                    entry.value.clone(),
+                    Style::default().fg(TEXT_PRIMARY),
+                ));
+                spans.push(Span::styled("]", bracket_style));
+                if let Some(idx) = current_idx {
+                    spans.push(Span::styled(
+                        format!(" ({}/{})", idx + 1, opts.len()),
+                        GHOST_STYLE,
+                    ));
+                }
+                if is_active {
+                    spans.push(Span::styled(" <Space> cycle", GHOST_STYLE));
+                }
+            }
+            _ => {
+                spans.push(Span::styled("[", bracket_style));
+                spans.push(Span::styled(
+                    entry.value.clone(),
+                    Style::default().fg(TEXT_PRIMARY),
+                ));
+                spans.push(Span::styled("]", bracket_style));
+                if is_active && entry.has_options() {
+                    spans.push(Span::styled(" <Space> cycle", GHOST_STYLE));
+                }
+            }
+        }
+
+        Line::from(spans)
+    }
+
+    fn render_editing_line(
+        &self,
+        entry: &ParamEntry,
+        truncated_key: &str,
+        key_style: Style,
+    ) -> Line<'static> {
+        let (before, after) = entry.value.split_at(self.cursor_pos.min(entry.value.len()));
+        let cursor_char = after.chars().next().unwrap_or(' ');
+        let rest = if after.is_empty() {
+            String::new()
+        } else {
+            after[cursor_char.len_utf8()..].to_string()
+        };
+        Line::from(vec![
+            Span::styled(format!("{truncated_key}: "), key_style),
+            Span::styled(before.to_string(), Style::default().fg(TEXT_PRIMARY)),
+            Span::styled(
+                cursor_char.to_string(),
+                Style::default()
+                    .fg(SURFACE_STYLE.bg.unwrap_or(ratatui::style::Color::Black))
+                    .bg(TEXT_PRIMARY),
+            ),
+            Span::styled(rest, Style::default().fg(TEXT_PRIMARY)),
+        ])
+    }
+}
+
+fn render_ghost_line(
+    entry: &ParamEntry,
+    key_padding: usize,
+    is_active: bool,
+) -> Option<Line<'static>> {
+    let padding = " ".repeat(key_padding + 2); // align with value after "key: "
+
+    // Description always takes priority
+    if let Some(desc) = &entry.description {
+        return Some(Line::from(Span::styled(
+            format!("{padding}{desc}"),
+            GHOST_STYLE,
+        )));
+    }
+
+    // For active entries with options, show the option list
+    if is_active {
+        let opts = entry.options();
+        if !opts.is_empty() {
+            let opts_display: Vec<String> = opts
+                .iter()
+                .map(|o| {
+                    if *o == entry.value {
+                        format!("[{o}]")
+                    } else {
+                        o.clone()
+                    }
+                })
+                .collect();
+            return Some(Line::from(Span::styled(
+                format!("{padding}{}", opts_display.join(" | ")),
+                GHOST_STYLE,
+            )));
+        }
+    }
+
+    None
 }
