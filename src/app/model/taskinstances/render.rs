@@ -100,5 +100,10 @@ impl Widget for &mut TaskInstanceModel {
             Some(TaskInstancePopUp::Graph(popup)) => popup.render(area, buffer),
             None => {}
         }
+
+        // Render rendered fields overlay on top of everything
+        if let Some(view) = self.rendered_fields_view.as_mut() {
+            view.render(area, buffer);
+        }
     }
 }

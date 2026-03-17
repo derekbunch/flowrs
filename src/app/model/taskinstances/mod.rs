@@ -1,6 +1,9 @@
 pub mod commands;
 pub mod popup;
 mod render;
+pub mod rendered_fields_view;
+
+pub use rendered_fields_view::RenderedFieldsView;
 
 use commands::TASK_COMMAND_POP_UP;
 use crossterm::event::KeyCode;
@@ -35,6 +38,7 @@ pub struct TaskInstanceModel {
     poll_tick_multiplier: u32,
     event_buffer: Vec<KeyCode>,
     pub task_graph: Option<TaskGraph>,
+    pub rendered_fields_view: Option<RenderedFieldsView>,
 }
 
 impl Default for TaskInstanceModel {
@@ -48,6 +52,7 @@ impl Default for TaskInstanceModel {
             poll_tick_multiplier: 10,
             event_buffer: Vec::new(),
             task_graph: None,
+            rendered_fields_view: None,
         }
     }
 }
@@ -96,6 +101,16 @@ impl TaskInstanceModel {
 }
 
 impl TaskInstanceModel {
+    fn handle_rendered_fields_view(&mut self, key_code: KeyCode) -> KeyResult {
+        let Some(view) = self.rendered_fields_view.as_mut() else {
+            return KeyResult::Ignored;
+        };
+        if view.update(key_code) {
+            self.rendered_fields_view = None;
+        }
+        KeyResult::Consumed
+    }
+
     /// Handle model-specific popups (returns messages from popup)
     fn handle_popup(
         &mut self,
@@ -176,6 +191,14 @@ impl TaskInstanceModel {
                 }
                 KeyResult::Consumed
             }
+            KeyCode::Char('r') => {
+                if let Some(task_instance) = self.table.current() {
+                    if let Some(ref fields) = task_instance.rendered_fields {
+                        self.rendered_fields_view = Some(RenderedFieldsView::new(fields));
+                    }
+                }
+                KeyResult::Consumed
+            }
             KeyCode::Char('o') => {
                 if let Some(task_instance) = self.table.current() {
                     KeyResult::PassWith(vec![WorkerMessage::OpenItem(OpenItem::TaskInstance {
@@ -222,8 +245,8 @@ impl Model for TaskInstanceModel {
                 }
 
                 let result = self
-                    .table
-                    .handle_filter_key(key_event)
+                    .handle_rendered_fields_view(key_event.code)
+                    .or_else(|| self.table.handle_filter_key(key_event))
                     .or_else(|| self.popup.handle_dismiss(key_event.code))
                     .or_else(|| self.table.handle_visual_mode_key(key_event.code))
                     .or_else(|| {

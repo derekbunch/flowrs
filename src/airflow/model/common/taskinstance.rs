@@ -95,6 +95,7 @@ pub struct TaskInstance {
     pub scheduled_when: Option<OffsetDateTime>,
     pub pid: Option<i64>,
     pub note: Option<String>,
+    pub rendered_fields: Option<serde_json::Value>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]

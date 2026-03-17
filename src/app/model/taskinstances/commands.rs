@@ -20,6 +20,11 @@ pub static TASK_COMMAND_POP_UP: LazyLock<CommandPopUp> = LazyLock::new(|| {
             description: "Mark selected task instance(s)",
         },
         Command {
+            name: "Rendered",
+            key_binding: "r",
+            description: "View rendered template fields",
+        },
+        Command {
             name: "Filter",
             key_binding: "/",
             description: "Filter task instances",

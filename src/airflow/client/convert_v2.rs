@@ -102,6 +102,7 @@ pub(crate) fn v2_task_instance_to_domain(
         scheduled_when: value.scheduled_when,
         pid: value.pid,
         note: value.note,
+        rendered_fields: Some(value.rendered_fields),
     }
 }
 
