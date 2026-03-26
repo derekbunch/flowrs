@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, StatefulWidget,
-    Widget,
+    Widget, Wrap,
 };
 
 use crate::app::model::popup::popup_area;
@@ -27,6 +27,7 @@ impl RenderedFieldsView {
         let content = Paragraph::new(self.lines.clone())
             .block(popup)
             .style(t.default_style)
+            .wrap(Wrap { trim: false })
             .scroll((self.vertical_scroll as u16, 0));
 
         Clear.render(area, buf);
