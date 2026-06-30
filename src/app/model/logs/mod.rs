@@ -2,6 +2,7 @@ mod render;
 
 use crossterm::event::KeyCode;
 use ratatui::widgets::ScrollbarState;
+use unicode_width::UnicodeWidthStr;
 
 use crate::airflow::model::common::{Log, OpenItem};
 use crate::app::events::custom::FlowrsEvent;
@@ -25,17 +26,36 @@ pub enum ScrollMode {
 }
 
 impl ScrollMode {
-    /// Returns the concrete scroll position for the given content length.
-    fn position(&self, line_count: usize) -> usize {
+    /// Returns the concrete scroll position for the rendered content height.
+    pub(crate) fn position(&self, content_height: usize, viewport_height: usize) -> usize {
+        let bottom = bottom_scroll_position(content_height, viewport_height);
         match self {
-            ScrollMode::Following => line_count.saturating_sub(1),
-            ScrollMode::Manual { position } => *position,
+            ScrollMode::Following => bottom,
+            ScrollMode::Manual { position } => (*position).min(bottom),
         }
     }
 
     fn is_following(&self) -> bool {
         matches!(self, ScrollMode::Following)
     }
+}
+
+pub(crate) fn bottom_scroll_position(content_height: usize, viewport_height: usize) -> usize {
+    content_height.saturating_sub(viewport_height)
+}
+
+pub(crate) fn wrapped_line_count(content: &str, line_width: usize) -> usize {
+    if line_width == 0 {
+        return content.lines().count();
+    }
+
+    content
+        .lines()
+        .map(|line| {
+            let rendered_width = UnicodeWidthStr::width(line);
+            rendered_width.saturating_sub(1) / line_width + 1
+        })
+        .sum()
 }
 
 pub struct LogModel {
@@ -46,6 +66,9 @@ pub struct LogModel {
     poll_tick_multiplier: u32,
     pub(crate) scroll_mode: ScrollMode,
     pub(crate) vertical_scroll_state: ScrollbarState,
+    pub(crate) last_scroll_position: usize,
+    pub(crate) last_bottom_scroll_position: usize,
+    pub(crate) last_viewport_height: usize,
     pending_g: bool,
 }
 
@@ -59,6 +82,9 @@ impl Default for LogModel {
             poll_tick_multiplier: 10,
             scroll_mode: ScrollMode::default(),
             vertical_scroll_state: ScrollbarState::default(),
+            last_scroll_position: 0,
+            last_bottom_scroll_position: 0,
+            last_viewport_height: 1,
             pending_g: false,
         }
     }
@@ -83,12 +109,23 @@ impl LogModel {
         self.all = logs;
     }
 
-    /// Returns the total number of lines in the current log content
-    pub(crate) fn current_line_count(&self) -> usize {
-        let Some(log) = self.all.get(self.current % self.all.len().max(1)) else {
-            return 0;
+    fn scroll_up(&mut self, amount: usize) {
+        self.scroll_mode = ScrollMode::Manual {
+            position: self.last_scroll_position.saturating_sub(amount.max(1)),
         };
-        log.content.lines().count()
+    }
+
+    fn scroll_down(&mut self, amount: usize) {
+        let new_pos = self.last_scroll_position.saturating_add(amount.max(1));
+        if new_pos >= self.last_bottom_scroll_position {
+            self.scroll_mode = ScrollMode::Following;
+        } else {
+            self.scroll_mode = ScrollMode::Manual { position: new_pos };
+        }
+    }
+
+    fn half_page_height(&self) -> usize {
+        (self.last_viewport_height / 2).max(1)
     }
 }
 
@@ -151,21 +188,22 @@ impl Model for LogModel {
                         self.current -= 1;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        let line_count = self.current_line_count();
-                        let current_pos = self.scroll_mode.position(line_count);
-                        let new_pos = current_pos.saturating_add(1);
-                        if new_pos >= line_count.saturating_sub(1) {
-                            self.scroll_mode = ScrollMode::Following;
-                        } else {
-                            self.scroll_mode = ScrollMode::Manual { position: new_pos };
-                        }
+                        self.scroll_down(1);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        let line_count = self.current_line_count();
-                        let current_pos = self.scroll_mode.position(line_count);
-                        self.scroll_mode = ScrollMode::Manual {
-                            position: current_pos.saturating_sub(1),
-                        };
+                        self.scroll_up(1);
+                    }
+                    KeyCode::Char('u') => {
+                        self.scroll_up(self.half_page_height());
+                    }
+                    KeyCode::Char('d') => {
+                        self.scroll_down(self.half_page_height());
+                    }
+                    KeyCode::Char('b') => {
+                        self.scroll_up(self.last_viewport_height);
+                    }
+                    KeyCode::Char('f') => {
+                        self.scroll_down(self.last_viewport_height);
                     }
                     KeyCode::Char('o') => {
                         if self.all.get(self.current % self.all.len()).is_some() {
@@ -191,9 +229,8 @@ impl Model for LogModel {
                     KeyCode::Char('F') => {
                         // Toggle follow mode
                         if self.scroll_mode.is_following() {
-                            let line_count = self.current_line_count();
                             self.scroll_mode = ScrollMode::Manual {
-                                position: line_count.saturating_sub(1),
+                                position: self.last_scroll_position,
                             };
                         } else {
                             self.scroll_mode = ScrollMode::Following;
@@ -216,5 +253,82 @@ impl Model for LogModel {
         }
 
         (None, vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bottom_scroll_position, wrapped_line_count, LogModel, ScrollMode};
+
+    #[test]
+    fn follow_mode_uses_bottom_visible_offset() {
+        assert_eq!(ScrollMode::Following.position(100, 20), 80);
+        assert_eq!(ScrollMode::Following.position(10, 20), 0);
+    }
+
+    #[test]
+    fn manual_mode_is_clamped_to_bottom_offset() {
+        assert_eq!(ScrollMode::Manual { position: 12 }.position(100, 20), 12);
+        assert_eq!(ScrollMode::Manual { position: 90 }.position(100, 20), 80);
+    }
+
+    #[test]
+    fn bottom_scroll_offset_saturates_when_content_fits() {
+        assert_eq!(bottom_scroll_position(5, 20), 0);
+        assert_eq!(bottom_scroll_position(20, 20), 0);
+        assert_eq!(bottom_scroll_position(21, 20), 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_counts_visual_rows() {
+        assert_eq!(wrapped_line_count("12345\n1234567890\n12345678901", 10), 4);
+        assert_eq!(wrapped_line_count("", 10), 0);
+        assert_eq!(wrapped_line_count("abc", 0), 1);
+    }
+
+    #[test]
+    fn fast_scroll_uses_viewport_relative_amounts() {
+        let mut model = LogModel {
+            last_scroll_position: 50,
+            last_bottom_scroll_position: 100,
+            last_viewport_height: 20,
+            ..LogModel::default()
+        };
+
+        model.scroll_up(model.half_page_height());
+        assert_manual_position(&model.scroll_mode, 40);
+
+        model.last_scroll_position = 50;
+        model.scroll_down(model.half_page_height());
+        assert_manual_position(&model.scroll_mode, 60);
+
+        model.last_scroll_position = 50;
+        model.scroll_up(model.last_viewport_height);
+        assert_manual_position(&model.scroll_mode, 30);
+
+        model.last_scroll_position = 50;
+        model.scroll_down(model.last_viewport_height);
+        assert_manual_position(&model.scroll_mode, 70);
+    }
+
+    #[test]
+    fn fast_scroll_down_resumes_follow_at_bottom() {
+        let mut model = LogModel {
+            last_scroll_position: 95,
+            last_bottom_scroll_position: 100,
+            last_viewport_height: 20,
+            ..LogModel::default()
+        };
+
+        model.scroll_down(model.half_page_height());
+
+        assert!(model.scroll_mode.is_following());
+    }
+
+    fn assert_manual_position(scroll_mode: &ScrollMode, expected: usize) {
+        match scroll_mode {
+            ScrollMode::Manual { position } => assert_eq!(*position, expected),
+            ScrollMode::Following => panic!("expected manual scroll position {expected}"),
+        }
     }
 }

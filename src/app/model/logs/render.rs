@@ -11,7 +11,7 @@ use ratatui::{
 
 use crate::ui::theme::theme;
 
-use super::LogModel;
+use super::{bottom_scroll_position, wrapped_line_count, LogModel};
 
 impl Widget for &mut LogModel {
     fn render(self, area: Rect, buffer: &mut Buffer) {
@@ -59,9 +59,21 @@ impl Widget for &mut LogModel {
                 content.push_line(Line::raw(line));
             }
 
-            let line_count = self.current_line_count();
-            let scroll_pos = self.scroll_mode.position(line_count);
-            self.vertical_scroll_state = self.vertical_scroll_state.position(scroll_pos);
+            let log_area = chunks[1];
+            let viewport_height = log_area.height.saturating_sub(2) as usize;
+            let line_width = log_area.width.saturating_sub(2) as usize;
+            let rendered_line_count = wrapped_line_count(&log.content, line_width);
+            self.last_viewport_height = viewport_height.max(1);
+            self.last_bottom_scroll_position =
+                bottom_scroll_position(rendered_line_count, viewport_height);
+            let scroll_pos = self
+                .scroll_mode
+                .position(rendered_line_count, viewport_height);
+            self.last_scroll_position = scroll_pos;
+            self.vertical_scroll_state = self
+                .vertical_scroll_state
+                .content_length(rendered_line_count)
+                .position(scroll_pos);
 
             #[allow(clippy::cast_possible_truncation)]
             let paragraph = Paragraph::new(content)
